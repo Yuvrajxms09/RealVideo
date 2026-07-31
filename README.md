@@ -156,6 +156,11 @@ HTTPS reverse proxy such as Cloudflare Tunnel.
 
 #### Google Colab
 
+Use [`RealVideo_Colab_Profiling.ipynb`](RealVideo_Colab_Profiling.ipynb) for a
+single-GPU setup with model downloads, direct image-and-audio inference, three
+repeatable profiling trials, result aggregation, and optional Cloudflare UI
+access. Direct-audio profiling does not require a Z.ai API key.
+
 Processes running in the same Colab runtime can access the service directly at
 `http://127.0.0.1:8003`. Automated profiling clients should use this local
 address so external network latency does not affect their measurements.
