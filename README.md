@@ -66,9 +66,20 @@ PATH_TO_YOUR_MODEL = "zai-org/RealVideo/model.pt"  # Replace with your model pat
 
 ### 4. Start the Service
 
-Specify the number of GPUs you wish to use and run the startup script, at least 2 GPUs (per 80GB, such as H100, H200).
+Set the checkpoint path and choose the visible GPUs. With one visible GPU, the
+service automatically uses the in-process single-GPU engine:
 
-For example:
+```bash
+export REALVIDEO_CHECKPOINT_PATH=/absolute/path/to/model.pt
+CUDA_VISIBLE_DEVICES=0 bash ./scripts/run_app.sh
+```
+
+The single-GPU engine serializes DiT, VAE, text, and audio encoder work on one
+CUDA worker. A 96 GB GPU is recommended for the 14B checkpoint. Because DiT and
+VAE cannot overlap on one device, its throughput is not directly comparable to
+the `sp_size=1` numbers below, which use a separate GPU for the VAE.
+
+For distributed execution:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 bash ./scripts/run_app.sh
@@ -86,9 +97,84 @@ real-time generation can be achieved. Numbers in parentheses indicate the time t
 | 2                             | **384.86 ms**             | 655.92 ms (527.11 ms) |
 | 4                             | **306.39 ms**             | 513.72 ms (**480.68 ms**) |
 
-### 5. Access the Application
+### 5. Profiling
+
+Stage profiling writes JSON Lines metrics to `profiles/metrics-rank-0.jsonl`
+and exposes rolling summaries at `/api/status`.
+
+```bash
+REALVIDEO_PROFILE=1 \
+CUDA_VISIBLE_DEVICES=0 \
+bash ./scripts/run_app.sh
+```
+
+The default profiler is low overhead. Use synchronized CUDA timings only for a
+short diagnostic run because synchronization changes pipeline throughput:
+
+```bash
+REALVIDEO_PROFILE=1 \
+REALVIDEO_PROFILE_CUDA_SYNC=1 \
+CUDA_VISIBLE_DEVICES=0 \
+bash ./scripts/run_app.sh
+```
+
+For kernel/operator analysis, capture one warmed-up generated block and open
+the resulting Chrome trace in Perfetto or `chrome://tracing`:
+
+```bash
+REALVIDEO_PROFILE=1 \
+REALVIDEO_TORCH_PROFILE_BLOCK=3 \
+CUDA_VISIBLE_DEVICES=0 \
+bash ./scripts/run_app.sh
+```
+
+Traces are written to `profiles/torch-rank-0-block-3.json`. Change
+`REALVIDEO_PROFILE_DIR` to select another output directory.
+
+Structured lifecycle logs are written to stdout. To retain rotating log files:
+
+```bash
+REALVIDEO_LOG_FILE=logs/realvideo.log \
+LOG_LEVEL=INFO \
+CUDA_VISIBLE_DEVICES=0 \
+bash ./scripts/run_app.sh
+```
+
+The logs carry `session_id`, `request_id`, condition ID, command sequence,
+queue-wait latency, block dispatch latency, decode backpressure, output
+latency, and CUDA memory on failures. `REALVIDEO_FLOW_LOG_EVERY=N` controls
+how often completed blocks are logged. Use `LOG_LEVEL=WARNING` and
+`REALVIDEO_PROFILE=0` for final uninstrumented throughput measurements.
+
+### 6. Access the Application
 
 - **Main Page**: http://localhost:8003
+
+The browser client uses the page's origin for HTTP and WebSocket traffic. It
+therefore works unchanged when accessed directly over localhost or through an
+HTTPS reverse proxy such as Cloudflare Tunnel.
+
+#### Google Colab
+
+Processes running in the same Colab runtime can access the service directly at
+`http://127.0.0.1:8003`. Automated profiling clients should use this local
+address so external network latency does not affect their measurements.
+
+To access the UI from your browser, expose the same service with a Cloudflare
+Quick Tunnel after `cloudflared` is installed in the Colab runtime:
+
+```bash
+cloudflared tunnel --url http://127.0.0.1:8003
+```
+
+Open the generated `https://*.trycloudflare.com` URL. The UI automatically uses
+`wss://` through the tunnel and `ws://` when opened over localhost.
+
+RealVideo intentionally allows one active WebSocket session at a time. Stop or
+disconnect the automated profiling client before clicking **Connect** in the
+browser UI, and disconnect the browser UI before starting another profiling
+run. Cloudflare Quick Tunnel URLs are public development endpoints; do not
+share the URL or use it as a production deployment without authentication.
 
 ## Usage Instructions
 

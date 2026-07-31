@@ -1,27 +1,26 @@
 import copy
-import os
-from typing import List, Optional
-
-import torch
-import torch._dynamo
-import torch.distributed as dist
-
-torch._dynamo.config.suppress_errors = True
-
 import logging
+import os
 import queue
 import time
 import uuid
 from threading import Thread
+from typing import Optional
 
+import torch
+import torch._dynamo
+import torch.distributed as dist
 from einops import rearrange
 
 import self_forcing.utils.parallel_state as mpu
 from config.config import config as service_config
 from core import comm_utils
 from core.distributed import broadcast_dict, recv_dict
+from core.profiler import cuda_memory_snapshot, runtime_profiler
 from self_forcing.utils.misc import set_seed
-from self_forcing.utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder
+from self_forcing.utils.wan_wrapper import WanDiffusionWrapper
+
+torch._dynamo.config.suppress_errors = True
 
 logger = logging.getLogger(__name__)
 
@@ -56,14 +55,13 @@ class StreamCausalInferencePipeline(torch.nn.Module):
         self.sink_size = sink_size
         self.is_sparse_causal = is_sparse_causal
 
-        self.generator = WanDiffusionWrapper(
-            **getattr(args, "model_kwargs", {}),
-            is_causal=True,
-            skip_init_model=True,
-            **causal_model_kwargs,
-        )
-
-        self.text_encoder = WanTextEncoder()
+        with runtime_profiler.stage("dit.model_construct"):
+            self.generator = WanDiffusionWrapper(
+                **getattr(args, "model_kwargs", {}),
+                is_causal=True,
+                skip_init_model=True,
+                **causal_model_kwargs,
+            )
         # Step 2: Initialize all causal hyperparmeters
         self.scheduler = self.generator.get_scheduler()
         self.denoising_step_list = torch.tensor(
@@ -78,7 +76,9 @@ class StreamCausalInferencePipeline(torch.nn.Module):
         self.num_transformer_blocks = self.generator.model.num_layers
         self.num_heads = self.generator.model.num_heads
         self.dim = self.generator.model.dim
-        self.text_seq_len = self.text_encoder.seq_len
+        # The DiT only needs this fixed cache dimension. Constructing a second
+        # UMT5 encoder here wastes substantial CPU and GPU memory.
+        self.text_seq_len = getattr(args, "text_seq_len", 512)
 
         # self.latent_frame_size = args.image_or_video_shape[-2:]
         self.patch_size = self.generator.model.patch_size
@@ -98,6 +98,7 @@ class StreamCausalInferencePipeline(torch.nn.Module):
 
         self.profile = profile
         self.output_latent_queue = []
+        self.generated_block_count = 0
 
     @property
     def dtype(self):
@@ -131,56 +132,37 @@ class StreamCausalInferencePipeline(torch.nn.Module):
         else:
             self.sink_size = 1
 
-        # Set up profiling if requested
-        if self.profile:
-            init_start = torch.cuda.Event(enable_timing=True)
-            init_end = torch.cuda.Event(enable_timing=True)
-            cache_init_start = torch.cuda.Event(enable_timing=True)
-            cache_init_end = torch.cuda.Event(enable_timing=True)
-            init_start.record()
-            cache_init_start.record()
-
         # Step 1: Initialize KV cache to all zeros
         old_frame_seq_length_sp = self.frame_seq_length_sp
         self.frame_seq_length_sp = (
             height * width // self.patch_size[1] // self.patch_size[2]
         )
-        if self.kv_cache is None or old_frame_seq_length_sp != self.frame_seq_length_sp:
-            self._initialize_kv_cache(
-                batch_size=batch_size, dtype=self.dtype, device=self.device
-            )
-            self._initialize_crossattn_cache(
-                batch_size=batch_size, dtype=self.dtype, device=self.device
-            )
+        with runtime_profiler.stage("dit.cache_initialize_or_reset", cuda=True):
+            if (
+                self.kv_cache is None
+                or old_frame_seq_length_sp != self.frame_seq_length_sp
+            ):
+                self._initialize_kv_cache(
+                    batch_size=batch_size, dtype=self.dtype, device=self.device
+                )
+                self._initialize_crossattn_cache(
+                    batch_size=batch_size, dtype=self.dtype, device=self.device
+                )
 
-        else:
-            # reset cross attn cache
-            self.reset_crossattn_cache()
-            # reset kv cache
-            for block_index in range(len(self.kv_cache)):
-                self.kv_cache[block_index]["global_end_index"].fill_(0)
-                self.kv_cache[block_index]["local_end_index"].fill_(0)
-                # self.kv_cache[block_index]["global_end_index"] = 0
-                # self.kv_cache[block_index]["local_end_index"] = 0
+            else:
+                self.reset_crossattn_cache()
+                for block_index in range(len(self.kv_cache)):
+                    self.kv_cache[block_index]["global_end_index"].fill_(0)
+                    self.kv_cache[block_index]["local_end_index"].fill_(0)
 
         self.current_start_frame = 0
         self.current_start_token = (
             0 if not service_config.lip_sync.no_refresh_inference else torch.tensor(0)
         )
-        if self.profile:
-            cache_init_end.record()
-            torch.cuda.synchronize()
-            cache_init_time = cache_init_start.elapsed_time(cache_init_end)
-            logger.info(f"  - Clear caching time: {cache_init_time:.2f} ms")
-
-        self.s2v_prefill(conditional_dict=conditional_dict, sp_dim=sp_dim)
+        with runtime_profiler.stage("dit.prefill", cuda=True):
+            self.s2v_prefill(conditional_dict=conditional_dict, sp_dim=sp_dim)
         self.output_latent_queue = []
-
-        if self.profile:
-            init_end.record()
-            torch.cuda.synchronize()
-            init_time = init_start.elapsed_time(init_end)
-            logger.info(f"  - Initialization/caching time: {init_time:.2f} ms")
+        self.generated_block_count = 0
 
     def s2v_prefill(self, conditional_dict, sp_dim: Optional[str] = None):
         if self.generator.model_type == "s2v":
@@ -188,18 +170,19 @@ class StreamCausalInferencePipeline(torch.nn.Module):
             timestep = torch.zeros(
                 [batch_size, 1], device=self.device, dtype=torch.int64
             )
-            ref_length = self.generator(
-                noisy_image_or_video=conditional_dict["ref_latents"],
-                conditional_dict=conditional_dict,
-                timestep=timestep,
-                kv_cache=self.kv_cache,
-                crossattn_cache=self.crossattn_cache,
-                current_start=self.current_start_token,
-                sp_dim=sp_dim,
-                initial_ref=True,
-                sink_size=self.sink_size,
-                disable_float_conversion=True,
-            )
+            with runtime_profiler.stage("dit.prefill_forward", cuda=True):
+                ref_length = self.generator(
+                    noisy_image_or_video=conditional_dict["ref_latents"],
+                    conditional_dict=conditional_dict,
+                    timestep=timestep,
+                    kv_cache=self.kv_cache,
+                    crossattn_cache=self.crossattn_cache,
+                    current_start=self.current_start_token,
+                    sp_dim=sp_dim,
+                    initial_ref=True,
+                    sink_size=self.sink_size,
+                    disable_float_conversion=True,
+                )
             self.current_start_token += ref_length
 
     def inference_one_block(
@@ -218,16 +201,12 @@ class StreamCausalInferencePipeline(torch.nn.Module):
         else:
             raise NotImplementedError
 
-        if self.profile:
-            block_start = torch.cuda.Event(enable_timing=True)
-            block_end = torch.cuda.Event(enable_timing=True)
-            block_start.record()
-
-        noisy_input = torch.randn(
-            [1, self.num_frame_per_block, 16, height, width],
-            device=self.device,
-            dtype=self.dtype,
-        )
+        with runtime_profiler.stage("dit.noise_create", cuda=True):
+            noisy_input = torch.randn(
+                [1, self.num_frame_per_block, 16, height, width],
+                device=self.device,
+                dtype=self.dtype,
+            )
         current_num_frames = self.num_frame_per_block
         if conditional_dict.get("image_latent", None) is not None:
             block_conditional_dict = copy.copy(conditional_dict)
@@ -256,7 +235,12 @@ class StreamCausalInferencePipeline(torch.nn.Module):
 
         # Step 3.1: Spatial denoising loop
         for index, current_timestep in enumerate(self.denoising_step_list):
-            logger.info(f"current_timestep: {current_timestep}")
+            logger.debug(
+                "event=dit_denoise_step block=%d step=%d timestep=%d",
+                self.generated_block_count + 1,
+                index,
+                int(current_timestep),
+            )
             # set current timestep
             timestep = (
                 torch.ones(
@@ -268,78 +252,89 @@ class StreamCausalInferencePipeline(torch.nn.Module):
             )
 
             if index < len(self.denoising_step_list) - 1:
-                _, denoised_pred = self.generator(
-                    noisy_image_or_video=noisy_input,
-                    conditional_dict=block_conditional_dict,
-                    timestep=timestep,
-                    kv_cache=self.kv_cache,
-                    crossattn_cache=self.crossattn_cache,
-                    current_start=self.current_start_token,
-                    sp_dim=sp_dim,
-                    slice_index=slice_index,
-                    sink_size=self.sink_size,
-                    disable_float_conversion=True,
-                    **kwargs,
-                )
-                next_timestep = self.denoising_step_list[index + 1]
-                noisy_input = (
-                    self.scheduler.add_noise(
-                        denoised_pred.flatten(0, 1),
-                        torch.randn_like(denoised_pred.flatten(0, 1)),
-                        next_timestep
-                        * torch.ones(
-                            [batch_size * current_num_frames],
-                            device=self.device,
-                            dtype=torch.long,
-                        ),
+                with runtime_profiler.stage(
+                    "dit.denoise_forward",
+                    cuda=True,
+                    metadata={"step": index, "timestep": int(current_timestep)},
+                ):
+                    _, denoised_pred = self.generator(
+                        noisy_image_or_video=noisy_input,
+                        conditional_dict=block_conditional_dict,
+                        timestep=timestep,
+                        kv_cache=self.kv_cache,
+                        crossattn_cache=self.crossattn_cache,
+                        current_start=self.current_start_token,
+                        sp_dim=sp_dim,
+                        slice_index=slice_index,
+                        sink_size=self.sink_size,
+                        disable_float_conversion=True,
+                        **kwargs,
                     )
-                    .unflatten(0, denoised_pred.shape[:2])
-                    .to(self.dtype)
-                )
+                next_timestep = self.denoising_step_list[index + 1]
+                with runtime_profiler.stage(
+                    "dit.scheduler_add_noise",
+                    cuda=True,
+                    metadata={"step": index},
+                ):
+                    noisy_input = (
+                        self.scheduler.add_noise(
+                            denoised_pred.flatten(0, 1),
+                            torch.randn_like(denoised_pred.flatten(0, 1)),
+                            next_timestep
+                            * torch.ones(
+                                [batch_size * current_num_frames],
+                                device=self.device,
+                                dtype=torch.long,
+                            ),
+                        )
+                        .unflatten(0, denoised_pred.shape[:2])
+                        .to(self.dtype)
+                    )
             else:
                 # for getting real output
-                _, denoised_pred = self.generator(
-                    noisy_image_or_video=noisy_input,
-                    conditional_dict=block_conditional_dict,
-                    timestep=timestep,
-                    kv_cache=self.kv_cache,
-                    crossattn_cache=self.crossattn_cache,
-                    current_start=self.current_start_token,
-                    sp_dim=sp_dim,
-                    slice_index=slice_index,
-                    sink_size=self.sink_size,
-                    disable_float_conversion=True,
-                    **kwargs,
-                )
+                with runtime_profiler.stage(
+                    "dit.denoise_forward",
+                    cuda=True,
+                    metadata={"step": index, "timestep": int(current_timestep)},
+                ):
+                    _, denoised_pred = self.generator(
+                        noisy_image_or_video=noisy_input,
+                        conditional_dict=block_conditional_dict,
+                        timestep=timestep,
+                        kv_cache=self.kv_cache,
+                        crossattn_cache=self.crossattn_cache,
+                        current_start=self.current_start_token,
+                        sp_dim=sp_dim,
+                        slice_index=slice_index,
+                        sink_size=self.sink_size,
+                        disable_float_conversion=True,
+                        **kwargs,
+                    )
 
         # Step 3.2: record the model's output
         output = denoised_pred.to(self.dtype)
 
         # Step 3.3: rerun with timestep zero to update KV cache using clean context
         context_timestep = torch.ones_like(timestep) * self.args.context_noise
-        self.generator(
-            noisy_image_or_video=denoised_pred,
-            conditional_dict=block_conditional_dict,
-            timestep=context_timestep,
-            kv_cache=self.kv_cache,
-            crossattn_cache=self.crossattn_cache,
-            current_start=self.current_start_token,
-            sp_dim=sp_dim,
-            slice_index=slice_index,
-            sink_size=self.sink_size,
-            disable_float_conversion=True,
-            **kwargs,
-        )
-
-        if self.profile:
-            block_end.record()
-            torch.cuda.synchronize()
-            block_time = block_start.elapsed_time(block_end)
-            logger.info(f"  - Block generation time: {block_time:.2f} ms")
+        with runtime_profiler.stage("dit.context_cache_forward", cuda=True):
+            self.generator(
+                noisy_image_or_video=denoised_pred,
+                conditional_dict=block_conditional_dict,
+                timestep=context_timestep,
+                kv_cache=self.kv_cache,
+                crossattn_cache=self.crossattn_cache,
+                current_start=self.current_start_token,
+                sp_dim=sp_dim,
+                slice_index=slice_index,
+                sink_size=self.sink_size,
+                disable_float_conversion=True,
+                **kwargs,
+            )
 
         # Step 3.4: update the start and end frame indices
         self.current_start_frame += current_num_frames
         self.current_start_token += self.frame_seq_length_sp * current_num_frames
+        self.generated_block_count += 1
 
         return output
 
@@ -449,34 +444,106 @@ class StreamCausalInferencePipeline(torch.nn.Module):
         self.crossattn_cache = crossattn_cache
 
 
-def main():
+def load_inference_pipeline(device) -> StreamCausalInferencePipeline:
     config = service_config.lip_sync.dit_config
-
     seed = getattr(service_config.lip_sync, "seed", 0)
-    # Initialize distributed inference
-    if "LOCAL_RANK" in os.environ:
-        set_seed(seed + mpu.get_sequence_parallel_rank())
-        device = torch.cuda.current_device()
-
-    else:
-        device = torch.device("cuda")
-        set_seed(seed)
-
+    sequence_parallel_rank = (
+        mpu.get_sequence_parallel_rank() if mpu.sequence_parallel_is_initialized() else 0
+    )
+    set_seed(seed + sequence_parallel_rank)
     torch.set_grad_enabled(False)
 
-    logger.info("Rank %d Initializing pipeline" % mpu.get_rank())
-    pipeline = StreamCausalInferencePipeline(
-        config, device=device, profile=service_config.lip_sync.profile
-    )
-
-    logger.info("Rank %d Loading checkpoint" % mpu.get_rank())
     checkpoint_path = getattr(service_config.lip_sync, "checkpoint_path", None)
     if checkpoint_path:
-        state_dict = torch.load(checkpoint_path, map_location="cpu")
-        pipeline.generator.load_state_dict(state_dict["generator"])
+        checkpoint_path = os.path.abspath(os.path.expanduser(checkpoint_path))
+        if not os.path.isfile(checkpoint_path):
+            raise FileNotFoundError(
+                "RealVideo checkpoint was not found at "
+                f"{checkpoint_path!r}. Set REALVIDEO_CHECKPOINT_PATH to the "
+                "downloaded model.pt file."
+            )
 
-    pipeline = pipeline.to(device=device, dtype=torch.bfloat16)
-    logger.info("Rank %d Pipeline init done" % mpu.get_rank())
+    logger.info(
+        "event=dit_pipeline_initializing rank=%d device=%s "
+        "denoising_steps=%s compile=%s no_refresh=%s checkpoint=%s",
+        mpu.get_rank(),
+        device,
+        list(config.denoising_step_list),
+        service_config.lip_sync.compile,
+        service_config.lip_sync.no_refresh_inference,
+        checkpoint_path,
+    )
+    with runtime_profiler.stage("dit.pipeline_initialize"):
+        pipeline = StreamCausalInferencePipeline(
+            config, device=device, profile=service_config.lip_sync.profile
+        )
+
+    if checkpoint_path:
+        logger.info(
+            "event=checkpoint_loading rank=%d path=%s mmap=true",
+            mpu.get_rank(),
+            checkpoint_path,
+        )
+        with runtime_profiler.stage("dit.checkpoint_load"):
+            try:
+                state_dict = torch.load(
+                    checkpoint_path,
+                    map_location="cpu",
+                    mmap=True,
+                    weights_only=True,
+                )
+            except RuntimeError as error:
+                if "mmap can only be used" not in str(error):
+                    raise
+                logger.warning(
+                    "event=checkpoint_mmap_unavailable path=%s "
+                    "fallback=standard_load",
+                    checkpoint_path,
+                )
+                state_dict = torch.load(
+                    checkpoint_path,
+                    map_location="cpu",
+                    weights_only=True,
+                )
+        logger.info(
+            "event=checkpoint_loaded rank=%d path=%s keys=%s",
+            mpu.get_rank(),
+            checkpoint_path,
+            list(state_dict.keys()),
+        )
+        if "generator" not in state_dict:
+            raise KeyError(
+                f"Checkpoint {checkpoint_path!r} does not contain a 'generator' state"
+            )
+        with runtime_profiler.stage("dit.checkpoint_apply"):
+            pipeline.generator.load_state_dict(
+                state_dict["generator"], assign=True
+            )
+        logger.info("event=checkpoint_applied rank=%d", mpu.get_rank())
+        del state_dict
+
+    logger.info(
+        "event=dit_move_to_gpu_started rank=%d device=%s",
+        mpu.get_rank(),
+        device,
+    )
+    with runtime_profiler.stage("dit.move_to_gpu", cuda=True):
+        pipeline = pipeline.to(device=device, dtype=torch.bfloat16)
+    logger.info(
+        "event=dit_pipeline_initialized rank=%d dtype=%s cuda_memory=%s",
+        mpu.get_rank(),
+        pipeline.dtype,
+        cuda_memory_snapshot(device),
+    )
+    return pipeline
+
+
+def main():
+    if "LOCAL_RANK" in os.environ:
+        device = torch.cuda.current_device()
+    else:
+        device = torch.device("cuda")
+    pipeline = load_inference_pipeline(device)
 
     if mpu.get_sequence_parallel_rank() == 0:
         signal_queue = queue.Queue(256)  # For receiving control signals
@@ -617,9 +684,10 @@ def main():
                         conditional_dict_diff["audio_input"].shape[-1] // 4
                     )
                     audio_finish_flag = False
-                    print(
-                        "Rank %d:" % mpu.get_rank(),
-                        "audio received with length",
+                    logger.info(
+                        "event=distributed_audio_received rank=%d "
+                        "audio_length=%d",
+                        mpu.get_rank(),
                         current_audio_length,
                     )
 
@@ -682,7 +750,7 @@ def main():
                     if mpu.get_sequence_parallel_rank() == 0:
                         logger.info(f"Rank {mpu.get_rank()} Flushing cond_queue")
                         while not cond_queue.empty():
-                            tmp = cond_queue.get()
+                            cond_queue.get()
 
                     conditional_dict = {}
                     sp_dim = None
@@ -707,13 +775,27 @@ def main():
                 )
 
             # Inference one block
-            output_block = pipeline.inference_one_block(
-                conditional_dict=conditional_dict,
-                sp_dim=sp_dim,
-                audio_ptr=min(
-                    audio_ptr, current_audio_length - pipeline.num_frame_per_block
-                ),
-            )
+            block_index = pipeline.generated_block_count + 1
+            with runtime_profiler.operator_trace(block_index):
+                with runtime_profiler.stage(
+                    "dit.block",
+                    cuda=True,
+                    metadata={
+                        "block": block_index,
+                        "denoising_steps": len(pipeline.denoising_step_list),
+                    },
+                ):
+                    output_block = pipeline.inference_one_block(
+                        conditional_dict=conditional_dict,
+                        sp_dim=sp_dim,
+                        audio_ptr=max(
+                            0,
+                            min(
+                                audio_ptr,
+                                current_audio_length - pipeline.num_frame_per_block,
+                            ),
+                        ),
+                    )
 
             if not service_config.lip_sync.no_refresh_inference:
                 pipeline.output_latent_queue.append(output_block)
@@ -737,10 +819,15 @@ def main():
                     torch.empty_like(output_block)
                     for i in range(mpu.get_sequence_parallel_world_size())
                 ]
-                torch.distributed.all_gather(
-                    output_list, output_block, group=mpu.get_sequence_parallel_group()
-                )
-                output_block = torch.cat(output_list, dim=-2 if sp_dim == "h" else -1)
+                with runtime_profiler.stage("distributed.output_all_gather", cuda=True):
+                    torch.distributed.all_gather(
+                        output_list,
+                        output_block,
+                        group=mpu.get_sequence_parallel_group(),
+                    )
+                    output_block = torch.cat(
+                        output_list, dim=-2 if sp_dim == "h" else -1
+                    )
 
             # Send output block
             if mpu.get_sequence_parallel_rank() == 0:
@@ -758,16 +845,17 @@ def main():
                     f"Rank {mpu.get_rank()}, send signal sent, waiting for ready signal."
                 )
 
-                ready_signal = ready_signal_queue.get(block=True)
+                ready_signal_queue.get(block=True)
                 torch.distributed.barrier(group=mpu.get_sequence_parallel_group())
                 start = time.time()
                 logger.info(f"Rank {mpu.get_rank()}, ready signal received, sending.")
 
-                dist.send(output_block.to(torch.bfloat16), dst=0)
-                torch.cuda.synchronize()
+                with runtime_profiler.stage("distributed.output_send", cuda=True):
+                    dist.send(output_block.to(torch.bfloat16), dst=0)
                 logger.info(
-                    "  - Rank %d, output block sent. Send time: %.3fms"
-                    % (mpu.get_rank(), (time.time() - start) * 1000)
+                    "Rank %d output block sent in %.3f ms",
+                    mpu.get_rank(),
+                    (time.time() - start) * 1000,
                 )
 
             else:

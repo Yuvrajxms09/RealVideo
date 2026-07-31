@@ -11,12 +11,21 @@ logger = logging.getLogger(__name__)
 
 
 def launch_distributed_job(backend: str = "nccl"):
-    print("backend:", backend)
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     host = os.environ["MASTER_ADDR"]
     port = int(os.environ["MASTER_PORT"])
+    logger.info(
+        "event=distributed_initializing backend=%s rank=%d local_rank=%d "
+        "world_size=%d master=%s:%d",
+        backend,
+        rank,
+        local_rank,
+        world_size,
+        host,
+        port,
+    )
 
     if ":" in host:  # IPv6
         init_method = f"tcp://[{host}]:{port}"
@@ -31,6 +40,12 @@ def launch_distributed_job(backend: str = "nccl"):
     )
     mpu.initialize_parallel_states()
     torch.cuda.set_device(local_rank)
+    logger.info(
+        "event=distributed_initialized backend=%s rank=%d local_rank=%d",
+        backend,
+        rank,
+        local_rank,
+    )
 
 
 def send_dict(data, dst=None, profile=False):

@@ -303,8 +303,6 @@
         const progressBar = document.getElementById('progressBar');
         const progressText = document.getElementById('progressText');
 
-        const API_BASE_URL = `${window.location.hostname}:8003`
-
         fileInput.addEventListener('change', function() {
             if (this.files && this.files[0]) {
                 handleFileSelection(this.files[0]);
@@ -486,7 +484,8 @@
 
         function connectWebSocket() {
             const clientId = Math.floor(Math.random() * 1000);
-            const wsUrl = `ws://${window.location.hostname}:8003/ws/${clientId}`;
+            const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${wsProtocol}//${window.location.host}/ws/${clientId}`;
             console.log(wsUrl)
 
             websocket = new WebSocket(wsUrl);

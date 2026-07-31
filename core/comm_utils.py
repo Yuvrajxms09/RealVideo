@@ -25,6 +25,13 @@ def run_socket_server(queue: Queue, port, host="localhost"):
     try:
         while True:
             data = client_socket.recv(256)
+            if not data:
+                logger.info(
+                    "event=socket_peer_closed rank=%d port=%d",
+                    mpu.get_rank(),
+                    port,
+                )
+                break
             buffer += data
             pos = buffer.find(b"\n")
             while pos >= 0:
@@ -33,7 +40,6 @@ def run_socket_server(queue: Queue, port, host="localhost"):
                     buffer = buffer[pos + 1 :]
                     pos = buffer.find(b"\n")
 
-                    id = str(uuid.uuid4())
                     msg = line.decode("utf-8")
                     logger.info(f"Rank {mpu.get_rank()}, Socket server received: {msg}")
                     data_dict = json.loads(msg)
@@ -70,7 +76,7 @@ async def handle_client(reader, writer, queue):
         while True:
             data = await reader.read(256)
             if not data:
-                continue
+                break
 
             buffer += data
             pos = buffer.find(b"\n")
@@ -102,5 +108,7 @@ def socket_send(data: dict, port, host="localhost", client_socket=None):
         client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
         client_socket.connect((host, port))
 
-    client_socket.send(json.dumps(data, ensure_ascii=False).encode("utf-8") + b"\n")
+    client_socket.sendall(
+        json.dumps(data, ensure_ascii=False).encode("utf-8") + b"\n"
+    )
     return client_socket

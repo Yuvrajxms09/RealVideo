@@ -51,7 +51,11 @@ class ConnectionManager:
             for client_id in disconnected_clients:
                 self.disconnect(client_id)
         except Exception as e:
-            logger.exception("Exception in broadcast:", e, type(e), flush=True)
+            logger.exception(
+                "event=websocket_broadcast_failed error_type=%s error=%s",
+                type(e).__name__,
+                e,
+            )
 
     async def broadcast_json(self, data: dict):
         await self.broadcast(json.dumps(data))

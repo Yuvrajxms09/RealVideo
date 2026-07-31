@@ -35,7 +35,7 @@ def get_sequence_parallel_src_rank():
     return torch.distributed.get_process_group_ranks(get_sequence_parallel_group())[0]
 
 def sequence_parallel_is_initialized():
-    return get_sequence_parallel_group() is not None
+    return get_sequence_parallel_group(check_initialized=False) is not None
 
 def destroy_parallel_groups():
     global _SEQUENCE_PARALLEL_GROUP

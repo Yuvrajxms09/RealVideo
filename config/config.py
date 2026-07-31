@@ -70,9 +70,24 @@ class Config:
         self._load_from_env()
 
     def _load_from_env(self):
-        self.api_key = os.getenv("ZHIPUAI_API_KEY")
+        self.api_key = os.getenv("ZAI_API_KEY") or os.getenv(
+            "ZHIPUAI_API_KEY"
+        )
         self.log_level = os.getenv("LOG_LEVEL", "DEBUG")
-        self.self_focing_config_path = os.getenv("CONFIG_PATH", "")
+        config_path = os.getenv("CONFIG_PATH")
+        if config_path:
+            self.lip_sync.self_forcing_config_path = config_path
+            selected_config = OmegaConf.load(config_path)
+            self.lip_sync.dit_config = OmegaConf.merge(
+                self.lip_sync.default_config, selected_config
+            )
+        checkpoint_path = os.getenv("REALVIDEO_CHECKPOINT_PATH")
+        if checkpoint_path:
+            self.lip_sync.checkpoint_path = checkpoint_path
+        if "REALVIDEO_PROFILE" in os.environ:
+            self.lip_sync.profile = os.environ[
+                "REALVIDEO_PROFILE"
+            ].strip().lower() in {"1", "true", "yes", "on"}
         self.audio_samples_per_video_block = round(
             self.audio.sample_rate
             / self.video.fps

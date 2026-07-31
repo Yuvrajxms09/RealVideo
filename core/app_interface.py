@@ -2,6 +2,9 @@ import asyncio
 import json
 import logging
 import os
+import time
+import traceback
+import uuid
 
 import uvicorn
 from fastapi import (
@@ -15,22 +18,18 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 
-logger = logging.getLogger(__name__)
-
-import logging
-import time
-import traceback
-import uuid
-
 from config.config import config
+from core.profiler import runtime_profiler
 
 from .connection import ConnectionManager
 from .model_handler import ModelHandler
 from .voice_clone import clone, get_voice_list, upload_audio_file
 
+logger = logging.getLogger(__name__)
+
 
 class RealVideoApp:
-    def __init__(self):
+    def __init__(self, single_gpu: bool = False):
         self.app = FastAPI(title="RealVideo")
         self.app.add_middleware(
             CORSMiddleware,
@@ -39,7 +38,7 @@ class RealVideoApp:
             allow_methods=["*"],
             allow_headers=["*"],
         )
-        self.model_handler = ModelHandler()
+        self.model_handler = ModelHandler(single_gpu=single_gpu)
         self.connection_manager = ConnectionManager()
         self.lip_sync_manager = self.model_handler.lip_sync_manager
 
@@ -51,16 +50,20 @@ class RealVideoApp:
         self.ws_lifecheck_task = None
 
         self._setup_routes()
+        self.app.add_event_handler("shutdown", self.model_handler.close)
 
         logger.info("Initialization finished.")
 
     def allowed_file(self, filename, file_type="img"):
-        return (
-            "." in filename
-            and filename.rsplit(".", 1)[1].lower() in self.allowed_image_exts
+        if not filename or "." not in filename:
+            return False
+        extension = filename.rsplit(".", 1)[1].lower()
+        allowed_extensions = (
+            self.allowed_image_exts
             if file_type == "img"
             else self.allowed_audio_exts
         )
+        return extension in allowed_extensions
 
     def _setup_routes(self):
         @self.app.get("/", response_class=HTMLResponse)
@@ -78,6 +81,8 @@ class RealVideoApp:
                 "status": "running",
                 "connections": self.connection_manager.get_connection_count(),
                 "timestamp": time.time(),
+                "runtime": self.model_handler.runtime_status(),
+                "profiler": runtime_profiler.snapshot(),
             }
 
         @self.app.post("/upload_image")
@@ -144,8 +149,8 @@ class RealVideoApp:
             try:
                 file_id = upload_audio_file(file_path)
                 logger.info(f"file uploaded: {file_id}")
-                clone_ret = clone(file_id, voice_name)
-                logger.info(f"voice clone finished")
+                clone(file_id, voice_name)
+                logger.info("voice clone finished")
 
             except Exception as e:
                 raise HTTPException(status_code=400, detail=f"Error: {e}")
@@ -187,6 +192,7 @@ class RealVideoApp:
 
                 await self.lip_sync_manager.connect_websocket(websocket)
                 await self.model_handler.start_jobs(websocket)
+                self.last_ws_message_time = time.time()
 
                 self.model_handler.tts_pipeline.reset_status()
 
@@ -197,12 +203,12 @@ class RealVideoApp:
                 await self._handle_websocket_connection(websocket, client_id)
 
             except WebSocketDisconnect:
-                await self.lip_sync_manager.disconnect_websocket()
+                await self.model_handler.end_session()
                 self.connection_manager.disconnect(client_id)
                 logger.info(f"Client {client_id} disconnected")
 
             except Exception as e:
-                await self.lip_sync_manager.disconnect_websocket()
+                await self.model_handler.end_session()
                 self.connection_manager.disconnect(client_id)
 
                 logger.exception(f"Exception in Client {client_id}: {e}")
@@ -214,10 +220,13 @@ class RealVideoApp:
                 data = await websocket.receive_text()
                 self.last_ws_message_time = time.time()
                 message_data = json.loads(data)
-                logger.info(message_data)
-
-                logger.debug(
-                    f"Received message from client {client_id}: {message_data.get('type', 'unknown')}"
+                logger.info(
+                    "event=websocket_message_received client_id=%d type=%s "
+                    "text_chars=%d audio_bytes=%d",
+                    client_id,
+                    message_data.get("type", "unknown"),
+                    len(message_data.get("text", "") or ""),
+                    len(message_data.get("audio", "") or ""),
                 )
 
                 if message_data["type"] in {"text", "audio"}:
@@ -234,11 +243,13 @@ class RealVideoApp:
                     logger.warning(f"Unknown message type: {message_data['type']}")
 
             except Exception as e:
-                logger.error(
-                    f"Failed to process message in _handle_websocket_connection: {e}, {type(e)}"
+                logger.exception(
+                    "event=websocket_message_failed client_id=%d "
+                    "error_type=%s error=%s",
+                    client_id,
+                    type(e).__name__,
+                    e,
                 )
-                print(traceback.format_exc(), flush=True)
-                await self.lip_sync_manager.disconnect_websocket()
                 raise
 
     async def _handle_text_audio_message(
@@ -251,7 +262,12 @@ class RealVideoApp:
             sample_rate = None
             voice_id = message_data.get("voice_id", None)
             logger.info(
-                f"Text message from client {client_id}: profile: {profile_content}, text: {text_content}"
+                "event=text_message_received client_id=%d text_chars=%d "
+                "profile_chars=%d has_voice_id=%s",
+                client_id,
+                len(text_content or ""),
+                len(profile_content or ""),
+                bool(voice_id),
             )
 
         elif message_data["type"] == "audio":
@@ -262,7 +278,11 @@ class RealVideoApp:
             voice_id = None
             if audio_content is not None:
                 logger.info(
-                    f"Audio message from client {client_id}: {len(audio_content)}"
+                    "event=audio_message_received client_id=%d encoded_bytes=%d "
+                    "sample_rate=%s",
+                    client_id,
+                    len(audio_content),
+                    sample_rate,
                 )
             else:
                 logger.info(f"Empty audio message from client {client_id}")
@@ -322,8 +342,10 @@ class RealVideoApp:
                         "Disconnecting websocket due to long time inactive %.3fs."
                         % (time.time() - self.last_ws_message_time)
                     )
-                    await self.lip_sync_manager.disconnect_websocket()
+                    await self.model_handler.end_session()
                     self.lip_sync_manager.websocket = None
+                    for client_id in self.connection_manager.get_client_ids():
+                        self.connection_manager.disconnect(client_id)
 
                 elif (
                     self.lip_sync_manager.websocket is not None
@@ -351,8 +373,8 @@ class RealVideoApp:
         )
 
 
-def main():
-    app = RealVideoApp()
+def main(single_gpu: bool = False):
+    app = RealVideoApp(single_gpu=single_gpu)
     app.run()
 
 
