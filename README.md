@@ -159,7 +159,9 @@ HTTPS reverse proxy such as Cloudflare Tunnel.
 Use [`RealVideo_Colab_Profiling.ipynb`](RealVideo_Colab_Profiling.ipynb) for a
 single-GPU setup with model downloads, direct image-and-audio inference, three
 repeatable profiling trials, result aggregation, and optional Cloudflare UI
-access. Direct-audio profiling does not require a Z.ai API key.
+access. Direct-audio profiling does not require a Z.ai API key. On Blackwell
+GPUs such as RTX PRO 6000, the notebook explicitly installs the PyTorch 2.7.1
+CUDA 12.8 wheels and verifies `sm_120` kernel execution before model startup.
 
 Processes running in the same Colab runtime can access the service directly at
 `http://127.0.0.1:8003`. Automated profiling clients should use this local
